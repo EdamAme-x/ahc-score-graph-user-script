@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AHC Score Graph
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.3
 // @match        https://atcoder.jp/contests/*/submissions/me*
 // @grant        none
 // ==/UserScript==
@@ -9,8 +9,25 @@
 (async function() {
   'use strict';
 
+  document.querySelectorAll('#ahc-score-graph-container').forEach(el => el.remove());
+
   const contestId = location.pathname.split('/')[2];
 
+  // --- localStorage helpers ---
+  const CACHE_KEY = `ahc-score-graph:${contestId}`;
+
+  function loadCache() {
+    try {
+      return JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+    } catch { return {}; }
+  }
+
+  function saveCache(patch) {
+    const cur = loadCache();
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ ...cur, ...patch }));
+  }
+
+  // --- Chart.js 読み込み ---
   if (!window.Chart) {
     await new Promise((res, rej) => {
       const s = document.createElement('script');
@@ -27,10 +44,9 @@
     document.head.appendChild(s);
   });
 
-  Object.keys(Chart.registry.plugins.items).filter(k => k.startsWith('perfBand')).forEach(id => {
-    try { const p = Chart.registry.getPlugin(id); if (p) Chart.unregister(p); } catch(e) {}
-  });
+  try { const ex = Chart.registry.getPlugin('perfBandsFinal'); if (ex) Chart.unregister(ex); } catch(e) {}
 
+  // --- データ取得 ---
   async function fetchAllPages() {
     const entries = [];
     const base = location.origin;
@@ -38,14 +54,12 @@
     params.set('f.Task', contestId + '_a');
     params.set('f.Status', 'AC');
     let page = 1;
-
     while (true) {
       params.set('page', page);
       const r = await fetch(base + location.pathname + '?' + params.toString());
       const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
       const rows = doc.querySelectorAll('tbody tr');
       if (!rows.length) break;
-
       rows.forEach(row => {
         const tds = row.querySelectorAll('td');
         if (tds.length < 5) return;
@@ -53,86 +67,50 @@
         if (!isNaN(score) && score > 0)
           entries.push({ date: new Date(tds[0].textContent.trim()), score });
       });
-
       if (!doc.querySelector('a[rel="next"]')) break;
       page++;
     }
-
     return entries.sort((a, b) => a.date - b.date);
   }
 
   async function fetchPerfBandScores(allEntries) {
+    // キャッシュチェック
+    const cache = loadCache();
+    if (cache.bandScores) return cache.bandScores;
+
     const [aperfsRes, stRes] = await Promise.all([
       fetch('https://data.ac-predictor.com/aperfs/' + contestId + '.json'),
       fetch('/contests/' + contestId + '/standings/json')
     ]);
-
     const aperfs = await aperfsRes.json();
     const st = await stRes.json();
-
     const ratedWithScore = st.StandingsData
       .filter(d => d.IsRated && d.TotalResult.Score > 0)
       .sort((a, b) => a.Rank - b.Rank);
-
     const groupAperfs = ratedWithScore.map(d => aperfs[d.UserScreenName] ?? 0);
     const calcRankFromPerf = p => groupAperfs.reduce((s, a) => s + 1 / (1 + Math.pow(6, (p - a) / 400)), 0);
-
-    const scores = allEntries.map(e => e.score).sort((a, b) => a - b);
-    const q1 = scores[Math.floor(scores.length * 0.25)];
-    const q3 = scores[Math.floor(scores.length * 0.75)];
-    const iqr = q3 - q1;
-    const filtered = allEntries.filter(e => e.score >= q1 - 1.5 * iqr && e.score <= q3 + 1.5 * iqr);
-    const latestScore = filtered[filtered.length - 1]?.score ?? allEntries[allEntries.length - 1].score;
 
     const userLink = document.querySelector('a[href*="/users/"]:not([href*="ranking"])');
     const username = userLink?.getAttribute('href')?.split('/users/')[1]?.split('/')[0] ?? '';
     const me = ratedWithScore.find(d => d.UserScreenName === username);
     if (!me) return null;
 
-    const top1 = ratedWithScore[0];
-    const minAbs = me.TotalResult.Score * latestScore / top1.TotalResult.Score;
-    const absScores = ratedWithScore.map(d => minAbs * top1.TotalResult.Score / d.TotalResult.Score);
+    const myLatestScore = allEntries[allEntries.length - 1].score;
+    const absScores = ratedWithScore.map(d =>
+      myLatestScore * d.TotalResult.Score / me.TotalResult.Score
+    );
 
     const bandScores = [2800, 2400, 2000, 1600, 1200, 800, 400].map(p => {
       const idx = Math.max(0, Math.min(Math.round(calcRankFromPerf(p)) - 1, absScores.length - 1));
       return absScores[idx];
     });
 
-    return { bandScores, highIsBetter: false };
+    saveCache({ bandScores });
+    return bandScores;
   }
 
-  function makeBandPlugin(bandScores, highIsBetter) {
-    const bandColors = ['#808080', '#804000', '#008000', '#00c0c0', '#0000ff', '#c0c000', '#ff8000', '#ff0000'];
-    const bandLabels = ['灰', '茶', '緑', '水', '青', '黄', '橙', '赤'];
-
-    return {
-      id: 'perfBandsFinal',
-      afterDraw(chart) {
-        const { ctx, chartArea: { top, bottom, left, right }, scales: { y } } = chart;
-        ctx.save();
-        const s = [...bandScores].sort((a, b) => highIsBetter ? b - a : a - b);
-
-        for (let i = 0; i < 8; i++) {
-          let bt, bb;
-          if (i === 0) { bt = top; bb = y.getPixelForValue(s[6]); }
-          else if (i === 7) { bt = y.getPixelForValue(s[0]); bb = bottom; }
-          else { bt = y.getPixelForValue(s[7 - i]); bb = y.getPixelForValue(s[6 - i]); }
-
-          const ct = Math.max(Math.min(bt, bb), top), cb = Math.min(Math.max(bt, bb), bottom);
-          if (ct >= bottom || cb <= top || ct >= cb) continue;
-
-          ctx.fillStyle = bandColors[i] + '30';
-          ctx.fillRect(left, ct, right - left, cb - ct);
-          ctx.fillStyle = bandColors[i];
-          ctx.font = '11px sans-serif';
-          ctx.textAlign = 'right';
-          ctx.fillText(bandLabels[i], right - 4, (ct + cb) / 2 + 4);
-        }
-
-        ctx.restore();
-      }
-    };
-  }
+  // --- UI構築 ---
+  const cache = loadCache();
 
   const container = document.createElement('div');
   container.id = 'ahc-score-graph-container';
@@ -142,22 +120,25 @@
   header.style.cssText = 'display:flex;align-items:center;gap:16px;margin-bottom:8px;';
 
   const title = document.createElement('span');
-  title.textContent = 'スコア推移';
-  title.style.fontWeight = 'bold';
+  title.textContent = 'スコア推移'; title.style.fontWeight = 'bold';
 
-  const outlierLabel = document.createElement('label');
-  outlierLabel.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;';
-  const outlierCb = document.createElement('input');
-  outlierCb.type = 'checkbox'; outlierCb.checked = true;
-  outlierLabel.append(outlierCb, document.createTextNode('外れ値除去'));
+  function makeCheckbox(label, defaultVal, cacheKey) {
+    const lbl = document.createElement('label');
+    lbl.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    // キャッシュがあればキャッシュ値、なければデフォルト値
+    cb.checked = (cache[cacheKey] !== undefined) ? cache[cacheKey] : defaultVal;
+    cb.addEventListener('change', () => saveCache({ [cacheKey]: cb.checked }));
+    lbl.append(cb, document.createTextNode(label));
+    return { lbl, cb };
+  }
 
-  const predLabel = document.createElement('label');
-  predLabel.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;';
-  const predCb = document.createElement('input');
-  predCb.type = 'checkbox'; predCb.checked = false;
-  predLabel.append(predCb, document.createTextNode('スコア予測'));
+  const { lbl: outlierLabel, cb: outlierCb } = makeCheckbox('外れ値除去',   true,  'outlier');
+  const { lbl: predLabel,    cb: predCb    } = makeCheckbox('スコア予測',    false, 'pred');
+  const { lbl: highLabel,    cb: highCb    } = makeCheckbox('高スコアが上位', true,  'highIsBetter');
 
-  header.append(title, outlierLabel, predLabel);
+  header.append(title, outlierLabel, predLabel, highLabel);
 
   const wrapper = document.createElement('div');
   wrapper.style.cssText = 'position:relative;width:100%;height:320px;';
@@ -166,15 +147,53 @@
   container.append(header, wrapper);
 
   document.querySelector('.table-responsive,table')?.parentNode?.insertBefore(
-    container,
-    document.querySelector('.table-responsive,table')
+    container, document.querySelector('.table-responsive,table')
   );
 
+  // --- データ取得 ---
   const allEntries = await fetchAllPages();
   if (!allEntries.length) return;
+  const bandScores = await fetchPerfBandScores(allEntries);
 
-  const bandData = await fetchPerfBandScores(allEntries);
+  // --- バンドプラグイン ---
+  function makeBandPlugin(bandScores, highIsBetter) {
+    const bandColors = ['#808080', '#804000', '#008000', '#00c0c0', '#0000ff', '#c0c000', '#ff8000', '#ff0000'];
+    const bandLabels = ['灰', '茶', '緑', '水', '青', '黄', '橙', '赤'];
+    return {
+      id: 'perfBandsFinal',
+      afterDraw(chart) {
+        const { ctx, chartArea: { top, bottom, left, right }, scales: { y } } = chart;
+        ctx.save();
+        const s = [...bandScores].sort((a, b) => a - b);
+        for (let i = 0; i < 8; i++) {
+          let bt, bb;
+          if (highIsBetter) {
+            if (i === 7)      { bt = top;                      bb = y.getPixelForValue(s[6]); }
+            else if (i === 0) { bt = y.getPixelForValue(s[0]); bb = bottom; }
+            else              { bt = y.getPixelForValue(s[i]); bb = y.getPixelForValue(s[i - 1]); }
+          } else {
+            if (i === 7)      { bt = y.getPixelForValue(s[0]);     bb = bottom; }
+            else if (i === 0) { bt = top;                          bb = y.getPixelForValue(s[6]); }
+            else              { bt = y.getPixelForValue(s[i - 1]); bb = y.getPixelForValue(s[i]); }
+          }
+          const ct = Math.max(Math.min(bt, bb), top);
+          const cb = Math.min(Math.max(bt, bb), bottom);
+          if (ct >= bottom || cb <= top || ct >= cb) continue;
+          ctx.fillStyle = bandColors[i] + '30';
+          ctx.fillRect(left, ct, right - left, cb - ct);
+          if (cb - ct >= 14) {
+            ctx.fillStyle = bandColors[i];
+            ctx.font = '11px sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillText(bandLabels[i], right - 4, (ct + cb) / 2 + 4);
+          }
+        }
+        ctx.restore();
+      }
+    };
+  }
 
+  // --- チャート構築 ---
   function filterOutliers(entries) {
     if (entries.length < 4) return entries;
     const sc = entries.map(e => e.score).sort((a, b) => a - b);
@@ -186,33 +205,23 @@
 
   let chartInstance = null, bandPlugin = null;
 
-  function buildChart(useOutlier, showPred) {
+  function buildChart(useOutlier, showPred, highIsBetter) {
     const entries = useOutlier ? filterOutliers(allEntries) : allEntries;
     const ys = entries.map(e => e.score);
     const yMin = Math.min(...ys), yMax = Math.max(...ys);
+
     let expandedMin = yMin, expandedMax = yMax;
-
-    if (bandData) {
-      const sorted = [...bandData.bandScores].sort((a, b) => a - b);
-      const range = yMax - yMin, pad = range * 0.15;
-      sorted.forEach(b => {
-        if (b > yMin - range && b < yMax + range) {
-          expandedMin = Math.min(expandedMin, b - pad);
-          expandedMax = Math.max(expandedMax, b + pad);
-        }
-      });
+    if (bandScores) {
+      const sorted = [...bandScores].sort((a, b) => a - b);
+      expandedMin = Math.min(expandedMin, sorted[0]);
+      expandedMax = Math.max(expandedMax, sorted[sorted.length - 1]);
     }
-
-    const yPad = (expandedMax - expandedMin) * 0.05;
+    const yPad = (expandedMax - expandedMin) * 0.08;
 
     const datasets = [{
-      label: 'スコア',
-      data: entries.map(e => ({ x: e.date, y: e.score })),
-      borderColor: '#4e79c4',
-      backgroundColor: '#4e79c450',
-      pointRadius: 4,
-      tension: 0.1,
-      fill: false
+      label: 'スコア', data: entries.map(e => ({ x: e.date, y: e.score })),
+      borderColor: '#4e79c4', backgroundColor: '#4e79c450',
+      pointRadius: 4, tension: 0.1, fill: false
     }];
 
     if (showPred && entries.length >= 2) {
@@ -229,37 +238,26 @@
         return { x: new Date(t), y: slope * t + intercept };
       });
       datasets.push({
-        label: '予測',
-        data: predPts,
-        borderColor: '#e05c5c',
-        borderDash: [5, 5],
-        pointRadius: 0,
-        tension: 0.1,
-        fill: false
+        label: '予測', data: predPts,
+        borderColor: '#e05c5c', borderDash: [5, 5],
+        pointRadius: 0, tension: 0.1, fill: false
       });
     }
 
     if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
-
     if (bandPlugin) {
-      try {
-        const ex = Chart.registry.getPlugin('perfBandsFinal');
-        if (ex) Chart.unregister(ex);
-      } catch(e) {}
+      try { const ex = Chart.registry.getPlugin('perfBandsFinal'); if (ex) Chart.unregister(ex); } catch(e) {}
       bandPlugin = null;
     }
-
-    if (bandData) {
-      bandPlugin = makeBandPlugin(bandData.bandScores, bandData.highIsBetter);
+    if (bandScores) {
+      bandPlugin = makeBandPlugin(bandScores, highIsBetter);
       Chart.register(bandPlugin);
     }
 
     chartInstance = new Chart(canvas, {
-      type: 'line',
-      data: { datasets },
+      type: 'line', data: { datasets },
       options: {
-        responsive: true,
-        maintainAspectRatio: false,
+        responsive: true, maintainAspectRatio: false,
         scales: {
           x: {
             type: 'time',
@@ -274,18 +272,16 @@
         },
         plugins: {
           legend: { display: false },
-          tooltip: {
-            callbacks: {
-              title: i => new Date(i[0].parsed.x).toLocaleString('ja-JP')
-            }
-          }
+          tooltip: { callbacks: { title: i => new Date(i[0].parsed.x).toLocaleString('ja-JP') } }
         }
       }
     });
   }
 
-  buildChart(true, false);
+  buildChart(outlierCb.checked, predCb.checked, highCb.checked);
 
-  outlierCb.addEventListener('change', () => buildChart(outlierCb.checked, predCb.checked));
-  predCb.addEventListener('change', () => buildChart(outlierCb.checked, predCb.checked));
+  outlierCb.addEventListener('change', () => buildChart(outlierCb.checked, predCb.checked, highCb.checked));
+  predCb.addEventListener('change',    () => buildChart(outlierCb.checked, predCb.checked, highCb.checked));
+  highCb.addEventListener('change',    () => buildChart(outlierCb.checked, predCb.checked, highCb.checked));
+
 })();
