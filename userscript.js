@@ -147,3 +147,135 @@
 
     return {
       label: '予測',
+      data: Array.from({ length: 151 }, (_, i) => {
+        const t = tLast + duration * (i / 150);
+        const dt = t - tLast;
+        const noise = amp * (Math.sin(f1 * dt) + 0.5 * Math.cos(f2 * dt));
+        return { x: new Date(t0 + t * 3600000), y: Math.round(a * t + b + noise) };
+      }),
+      borderColor: 'rgba(240,140,40,0.8)',
+      backgroundColor: 'transparent',
+      pointRadius: 0,
+      borderWidth: 1.5,
+      borderDash: [5, 4],
+      showLine: true,
+      order: 3,
+    };
+  }
+
+  function getOptions(withPrediction) {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: items => items[0]?.raw?.x?.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) || '',
+            label: ctx => `${ctx.dataset.label}: ${ctx.raw.y.toLocaleString()}`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: { displayFormats: { hour: 'HH:mm', minute: 'HH:mm' } },
+          ...(withPrediction && contestEnd ? { max: contestEnd } : {}),
+          ticks: {
+            maxRotation: 0,
+            autoSkip: true,
+            autoSkipPadding: 20,
+            callback: function (value, index, ticks) {
+              const date = new Date(ticks[index].value);
+              const hhmm = date.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tokyo' });
+              const dateStr = date.toLocaleDateString('ja-JP', { month: '2-digit', day: '2-digit', timeZone: 'Asia/Tokyo' });
+              const prev = index > 0 ? new Date(ticks[index - 1].value) : null;
+              const prevDateStr = prev ? prev.toLocaleDateString('ja-JP', { month: '2-digit', day: '2-digit', timeZone: 'Asia/Tokyo' }) : null;
+              return (index === 0 || dateStr !== prevDateStr) ? [hhmm, dateStr] : hhmm;
+            },
+          },
+        },
+        y: {
+          title: { display: true, text: 'スコア' },
+          ticks: { callback: v => v.toLocaleString() },
+        },
+      },
+    };
+  }
+
+  function update(on) {
+    chart.data.datasets = on ? [scoreDataset(), buildPredDataset()] : [scoreDataset()];
+    chart.options = getOptions(on);
+    chart.update();
+  }
+
+  async function main() {
+    const container = document.createElement('div');
+    container.id = 'ahc-score-graph-container';
+    container.style.cssText = 'background:#fff;border:1px solid #ddd;border-radius:6px;padding:16px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,0.08);';
+
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;';
+
+    const titleEl = document.createElement('div');
+    titleEl.textContent = 'スコア推移';
+    titleEl.style.cssText = 'font-weight:bold;font-size:15px;color:#333;';
+    header.appendChild(titleEl);
+
+    const toggleWrap = document.createElement('label');
+    toggleWrap.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:13px;color:#555;cursor:pointer;user-select:none;';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.style.cursor = 'pointer';
+    toggleWrap.appendChild(checkbox);
+    toggleWrap.appendChild(document.createTextNode('スコア予測'));
+    header.appendChild(toggleWrap);
+    container.appendChild(header);
+
+    const loading = document.createElement('p');
+    loading.id = 'ahc-graph-loading';
+    loading.textContent = 'データ読み込み中...';
+    loading.style.cssText = 'text-align:center;color:#888;margin:0;';
+    container.appendChild(loading);
+
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = 'height:280px;position:relative;';
+    const canvas = document.createElement('canvas');
+    canvas.id = 'ahc-score-chart';
+    wrapper.appendChild(canvas);
+    container.appendChild(wrapper);
+
+    const table = document.querySelector('table');
+    if (table?.parentNode) table.parentNode.insertBefore(container, table);
+
+    try {
+      await loadScript('https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js');
+
+      const entries = await fetchAllPages();
+      contestEnd = getContestEndDate();
+      allEntries = entries;
+
+      document.getElementById('ahc-graph-loading')?.remove();
+
+      if (entries.length === 0) {
+        container.insertAdjacentHTML('beforeend', '<p style="color:#888;text-align:center">データなし</p>');
+        return;
+      }
+
+      chart = new Chart(canvas.getContext('2d'), {
+        type: 'line',
+        data: { datasets: [scoreDataset()] },
+        options: getOptions(false),
+      });
+
+      checkbox.addEventListener('change', () => update(checkbox.checked));
+    } catch (err) {
+      const el = document.getElementById('ahc-graph-loading');
+      if (el) el.textContent = 'エラー: ' + err.message;
+      console.error(err);
+    }
+  }
+
+  main();
+})();
