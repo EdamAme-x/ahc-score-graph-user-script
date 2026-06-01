@@ -1,308 +1,291 @@
 // ==UserScript==
 // @name         AHC Score Graph
-// @description  AHC Score Graph
-// @author       https://github.com/EdamAme-x/ahc-score-graph-user-script
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      1.0
 // @match        https://atcoder.jp/contests/*/submissions/me*
 // @grant        none
 // ==/UserScript==
 
-(function () {
+(async function() {
   'use strict';
 
-  const contestMatch = location.pathname.match(/\/contests\/([^/]+)\//);
-  if (!contestMatch) return;
-  const contestId = contestMatch[1];
+  const contestId = location.pathname.split('/')[2];
 
-  function loadScript(url) {
-    return new Promise((resolve, reject) => {
+  if (!window.Chart) {
+    await new Promise((res, rej) => {
       const s = document.createElement('script');
-      s.src = url;
-      s.onload = resolve;
-      s.onerror = reject;
+      s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js';
+      s.onload = res; s.onerror = rej;
       document.head.appendChild(s);
     });
   }
 
-  function parseDate(text) {
-    text = text.trim().replace(/\+(\d{2})(\d{2})$/, '+$1:$2').replace(' ', 'T');
-    const d = new Date(text);
-    return isNaN(d.getTime()) ? null : d;
-  }
+  await new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js';
+    s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
 
-  function parseSubmissionsFromDoc(doc) {
-    const entries = [];
-    doc.querySelectorAll('table tbody tr').forEach(row => {
-      const cells = row.querySelectorAll('td');
-      if (cells.length < 7) return;
-      const date = parseDate(cells[0].textContent);
-      const score = parseInt(cells[4].textContent.replace(/,/g, ''), 10);
-      if (!date || isNaN(score) || score === 0) return;
-      entries.push({ date, score });
-    });
-    return entries;
-  }
-
-  function hasNextPage(doc) {
-    for (const li of doc.querySelectorAll('ul.pager li')) {
-      if (li.classList.contains('disabled')) continue;
-      const a = li.querySelector('a');
-      if (a && a.textContent.includes('Next')) return true;
-    }
-    return false;
-  }
+  Object.keys(Chart.registry.plugins.items).filter(k => k.startsWith('perfBand')).forEach(id => {
+    try { const p = Chart.registry.getPlugin(id); if (p) Chart.unregister(p); } catch(e) {}
+  });
 
   async function fetchAllPages() {
-    const base = `/contests/${contestId}/submissions/me`;
-    const fetchPage = (page) =>
-      fetch(`https://atcoder.jp${base}?page=${page}`)
-        .then(r => r.text())
-        .then(html => new DOMParser().parseFromString(html, 'text/html'));
-
-    const all = [];
+    const entries = [];
+    const base = location.origin;
+    const params = new URLSearchParams(location.search);
+    params.set('f.Task', contestId + '_a');
+    params.set('f.Status', 'AC');
     let page = 1;
-    let doc = await fetchPage(page);
+
     while (true) {
-      all.push(...parseSubmissionsFromDoc(doc));
-      if (!hasNextPage(doc) || page >= 100) break;
+      params.set('page', page);
+      const r = await fetch(base + location.pathname + '?' + params.toString());
+      const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+      const rows = doc.querySelectorAll('tbody tr');
+      if (!rows.length) break;
+
+      rows.forEach(row => {
+        const tds = row.querySelectorAll('td');
+        if (tds.length < 5) return;
+        const score = parseInt(tds[4].textContent.trim().replace(/,/g, ''), 10);
+        if (!isNaN(score) && score > 0)
+          entries.push({ date: new Date(tds[0].textContent.trim()), score });
+      });
+
+      if (!doc.querySelector('a[rel="next"]')) break;
       page++;
-      doc = await fetchPage(page);
     }
-    all.sort((a, b) => a.date - b.date);
-    return all;
+
+    return entries.sort((a, b) => a.date - b.date);
   }
 
-  function getContestEndDate() {
-    const links = document.querySelectorAll('a[href*="timeanddate"]');
-    if (links.length >= 2) {
-      const m = links[1].textContent.trim().match(/(\d{4}-\d{2}-\d{2})[^0-9]+(\d{2}:\d{2})/);
-      if (m) {
-        const d = new Date(`${m[1]}T${m[2]}:00+09:00`);
-        if (!isNaN(d.getTime())) return d;
-      }
-    }
-    return null;
-  }
+  async function fetchPerfBandScores(allEntries) {
+    const [aperfsRes, stRes] = await Promise.all([
+      fetch('https://data.ac-predictor.com/aperfs/' + contestId + '.json'),
+      fetch('/contests/' + contestId + '/standings/json')
+    ]);
 
-  function removeOutliers(entries) {
-    if (entries.length < 4) return entries;
-    const scores = entries.map(e => e.score).sort((a, b) => a - b);
+    const aperfs = await aperfsRes.json();
+    const st = await stRes.json();
+
+    const ratedWithScore = st.StandingsData
+      .filter(d => d.IsRated && d.TotalResult.Score > 0)
+      .sort((a, b) => a.Rank - b.Rank);
+
+    const groupAperfs = ratedWithScore.map(d => aperfs[d.UserScreenName] ?? 0);
+    const calcRankFromPerf = p => groupAperfs.reduce((s, a) => s + 1 / (1 + Math.pow(6, (p - a) / 400)), 0);
+
+    const scores = allEntries.map(e => e.score).sort((a, b) => a - b);
     const q1 = scores[Math.floor(scores.length * 0.25)];
     const q3 = scores[Math.floor(scores.length * 0.75)];
     const iqr = q3 - q1;
-    const lower = q1 - 1.5 * iqr;
-    const upper = q3 + 1.5 * iqr;
-    return entries.filter(e => e.score >= lower && e.score <= upper);
+    const filtered = allEntries.filter(e => e.score >= q1 - 1.5 * iqr && e.score <= q3 + 1.5 * iqr);
+    const latestScore = filtered[filtered.length - 1]?.score ?? allEntries[allEntries.length - 1].score;
+
+    const userLink = document.querySelector('a[href*="/users/"]:not([href*="ranking"])');
+    const username = userLink?.getAttribute('href')?.split('/users/')[1]?.split('/')[0] ?? '';
+    const me = ratedWithScore.find(d => d.UserScreenName === username);
+    if (!me) return null;
+
+    const top1 = ratedWithScore[0];
+    const minAbs = me.TotalResult.Score * latestScore / top1.TotalResult.Score;
+    const absScores = ratedWithScore.map(d => minAbs * top1.TotalResult.Score / d.TotalResult.Score);
+
+    const bandScores = [2800, 2400, 2000, 1600, 1200, 800, 400].map(p => {
+      const idx = Math.max(0, Math.min(Math.round(calcRankFromPerf(p)) - 1, absScores.length - 1));
+      return absScores[idx];
+    });
+
+    return { bandScores, highIsBetter: false };
   }
 
-  function linreg(xs, ys) {
-    const n = xs.length;
-    const mx = xs.reduce((s, x) => s + x, 0) / n;
-    const my = ys.reduce((s, y) => s + y, 0) / n;
-    let num = 0, den = 0;
-    for (let i = 0; i < n; i++) {
-      num += (xs[i] - mx) * (ys[i] - my);
-      den += (xs[i] - mx) ** 2;
-    }
-    return den === 0 ? 0 : num / den;
-  }
-
-  function blendedSlope(xs, ys) {
-    const N = Math.min(xs.length, 10);
-    let wA = 0, tW = 0;
-    for (let k = 3; k <= N; k++) {
-      const w = N - k + 1;
-      wA += w * linreg(xs.slice(-k), ys.slice(-k));
-      tW += w;
-    }
-    const raw = tW === 0 ? linreg(xs, ys) : wA / tW;
-    return raw * 0.5;
-  }
-
-  let chart = null;
-  let allEntries = [];
-  let contestEnd = null;
-
-  function getEntries(filterOutliers) {
-    return filterOutliers ? removeOutliers(allEntries) : allEntries;
-  }
-
-  function scoreDataset(filterOutliers) {
-    return {
-      label: 'スコア',
-      data: getEntries(filterOutliers).map(e => ({ x: e.date, y: e.score })),
-      borderColor: 'rgba(80,140,240,0.8)',
-      backgroundColor: 'transparent',
-      pointRadius: 3,
-      pointHoverRadius: 5,
-      borderWidth: 1.5,
-      showLine: true,
-      order: 2,
-    };
-  }
-
-  function buildPredDataset(filterOutliers) {
-    const entries = getEntries(filterOutliers);
-    const t0 = entries[0].date.getTime();
-    const xs = entries.map(e => (e.date.getTime() - t0) / 3600000);
-    const ys = entries.map(e => e.score);
-
-    const a = blendedSlope(xs, ys);
-    const tLast = xs[xs.length - 1];
-    const yLast = ys[ys.length - 1];
-    const b = yLast - a * tLast;
-    const tEnd = (contestEnd.getTime() - t0) / 3600000;
-    const duration = tEnd - tLast;
-    const amp = yLast * 0.003;
-    const f1 = (2 * Math.PI) / (duration / 2.5);
-    const f2 = (2 * Math.PI) / (duration / 1.3);
+  function makeBandPlugin(bandScores, highIsBetter) {
+    const bandColors = ['#808080', '#804000', '#008000', '#00c0c0', '#0000ff', '#c0c000', '#ff8000', '#ff0000'];
+    const bandLabels = ['灰', '茶', '緑', '水', '青', '黄', '橙', '赤'];
 
     return {
-      label: '予測',
-      data: Array.from({ length: 151 }, (_, i) => {
-        const t = tLast + duration * (i / 150);
-        const dt = t - tLast;
-        const noise = amp * (Math.sin(f1 * dt) + 0.5 * Math.cos(f2 * dt));
-        return { x: new Date(t0 + t * 3600000), y: Math.round(a * t + b + noise) };
-      }),
-      borderColor: 'rgba(240,140,40,0.8)',
-      backgroundColor: 'transparent',
-      pointRadius: 0,
-      borderWidth: 1.5,
-      borderDash: [5, 4],
-      showLine: true,
-      order: 3,
-    };
-  }
+      id: 'perfBandsFinal',
+      afterDraw(chart) {
+        const { ctx, chartArea: { top, bottom, left, right }, scales: { y } } = chart;
+        ctx.save();
+        const s = [...bandScores].sort((a, b) => highIsBetter ? b - a : a - b);
 
-  function getOptions(withPrediction) {
-    return {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            title: items => items[0]?.raw?.x?.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) || '',
-            label: ctx => `${ctx.dataset.label}: ${ctx.raw.y.toLocaleString()}`,
-          },
-        },
-      },
-      scales: {
-        x: {
-          type: 'time',
-          time: { displayFormats: { hour: 'HH:mm', minute: 'HH:mm' } },
-          ...(withPrediction && contestEnd ? { max: contestEnd } : {}),
-          ticks: {
-            maxRotation: 0,
-            autoSkip: true,
-            autoSkipPadding: 20,
-            callback: function (value, index, ticks) {
-              const date = new Date(ticks[index].value);
-              const hhmm = date.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Tokyo' });
-              const dateStr = date.toLocaleDateString('ja-JP', { month: '2-digit', day: '2-digit', timeZone: 'Asia/Tokyo' });
-              const prev = index > 0 ? new Date(ticks[index - 1].value) : null;
-              const prevDateStr = prev ? prev.toLocaleDateString('ja-JP', { month: '2-digit', day: '2-digit', timeZone: 'Asia/Tokyo' }) : null;
-              return (index === 0 || dateStr !== prevDateStr) ? [hhmm, dateStr] : hhmm;
-            },
-          },
-        },
-        y: {
-          title: { display: true, text: 'スコア' },
-          ticks: { callback: v => v.toLocaleString() },
-        },
-      },
-    };
-  }
+        for (let i = 0; i < 8; i++) {
+          let bt, bb;
+          if (i === 0) { bt = top; bb = y.getPixelForValue(s[6]); }
+          else if (i === 7) { bt = y.getPixelForValue(s[0]); bb = bottom; }
+          else { bt = y.getPixelForValue(s[7 - i]); bb = y.getPixelForValue(s[6 - i]); }
 
-  function update(predOn, filterOn) {
-    chart.data.datasets = predOn ? [scoreDataset(filterOn), buildPredDataset(filterOn)] : [scoreDataset(filterOn)];
-    chart.options = getOptions(predOn);
-    chart.update();
-  }
+          const ct = Math.max(Math.min(bt, bb), top), cb = Math.min(Math.max(bt, bb), bottom);
+          if (ct >= bottom || cb <= top || ct >= cb) continue;
 
-  async function main() {
-    const container = document.createElement('div');
-    container.id = 'ahc-score-graph-container';
-    container.style.cssText = 'background:#fff;border:1px solid #ddd;border-radius:6px;padding:16px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,0.08);';
+          ctx.fillStyle = bandColors[i] + '30';
+          ctx.fillRect(left, ct, right - left, cb - ct);
+          ctx.fillStyle = bandColors[i];
+          ctx.font = '11px sans-serif';
+          ctx.textAlign = 'right';
+          ctx.fillText(bandLabels[i], right - 4, (ct + cb) / 2 + 4);
+        }
 
-    const header = document.createElement('div');
-    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;';
-
-    const titleEl = document.createElement('div');
-    titleEl.textContent = 'スコア推移';
-    titleEl.style.cssText = 'font-weight:bold;font-size:15px;color:#333;';
-    header.appendChild(titleEl);
-
-    const controls = document.createElement('div');
-    controls.style.cssText = 'display:flex;align-items:center;gap:12px;';
-
-    const makeToggle = (label, defaultChecked) => {
-      const wrap = document.createElement('label');
-      wrap.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:13px;color:#555;cursor:pointer;user-select:none;';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = defaultChecked;
-      cb.style.cursor = 'pointer';
-      wrap.appendChild(cb);
-      wrap.appendChild(document.createTextNode(label));
-      return { wrap, cb };
-    };
-
-    const { wrap: filterWrap, cb: filterCb } = makeToggle('外れ値除去', true);
-    const { wrap: predWrap, cb: predCb } = makeToggle('スコア予測', false);
-
-    controls.appendChild(filterWrap);
-    controls.appendChild(predWrap);
-    header.appendChild(controls);
-    container.appendChild(header);
-
-    const loading = document.createElement('p');
-    loading.id = 'ahc-graph-loading';
-    loading.textContent = 'データ読み込み中...';
-    loading.style.cssText = 'text-align:center;color:#888;margin:0;';
-    container.appendChild(loading);
-
-    const wrapper = document.createElement('div');
-    wrapper.style.cssText = 'height:280px;position:relative;';
-    const canvas = document.createElement('canvas');
-    canvas.id = 'ahc-score-chart';
-    wrapper.appendChild(canvas);
-    container.appendChild(wrapper);
-
-    const table = document.querySelector('table');
-    if (table?.parentNode) table.parentNode.insertBefore(container, table);
-
-    try {
-      await loadScript('https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js');
-      await loadScript('https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js');
-
-      const entries = await fetchAllPages();
-      contestEnd = getContestEndDate();
-      allEntries = entries;
-
-      document.getElementById('ahc-graph-loading')?.remove();
-
-      if (entries.length === 0) {
-        container.insertAdjacentHTML('beforeend', '<p style="color:#888;text-align:center">データなし</p>');
-        return;
+        ctx.restore();
       }
-
-      chart = new Chart(canvas.getContext('2d'), {
-        type: 'line',
-        data: { datasets: [scoreDataset(true)] },
-        options: getOptions(false),
-      });
-
-      filterCb.addEventListener('change', () => update(predCb.checked, filterCb.checked));
-      predCb.addEventListener('change', () => update(predCb.checked, filterCb.checked));
-    } catch (err) {
-      const el = document.getElementById('ahc-graph-loading');
-      if (el) el.textContent = 'エラー: ' + err.message;
-      console.error(err);
-    }
+    };
   }
 
-  main();
+  const container = document.createElement('div');
+  container.id = 'ahc-score-graph-container';
+  container.style.cssText = 'margin:16px 0;padding:12px;background:#fff;border:1px solid #ddd;border-radius:4px;';
+
+  const header = document.createElement('div');
+  header.style.cssText = 'display:flex;align-items:center;gap:16px;margin-bottom:8px;';
+
+  const title = document.createElement('span');
+  title.textContent = 'スコア推移';
+  title.style.fontWeight = 'bold';
+
+  const outlierLabel = document.createElement('label');
+  outlierLabel.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;';
+  const outlierCb = document.createElement('input');
+  outlierCb.type = 'checkbox'; outlierCb.checked = true;
+  outlierLabel.append(outlierCb, document.createTextNode('外れ値除去'));
+
+  const predLabel = document.createElement('label');
+  predLabel.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;';
+  const predCb = document.createElement('input');
+  predCb.type = 'checkbox'; predCb.checked = false;
+  predLabel.append(predCb, document.createTextNode('スコア予測'));
+
+  header.append(title, outlierLabel, predLabel);
+
+  const wrapper = document.createElement('div');
+  wrapper.style.cssText = 'position:relative;width:100%;height:320px;';
+  const canvas = document.createElement('canvas');
+  wrapper.appendChild(canvas);
+  container.append(header, wrapper);
+
+  document.querySelector('.table-responsive,table')?.parentNode?.insertBefore(
+    container,
+    document.querySelector('.table-responsive,table')
+  );
+
+  const allEntries = await fetchAllPages();
+  if (!allEntries.length) return;
+
+  const bandData = await fetchPerfBandScores(allEntries);
+
+  function filterOutliers(entries) {
+    if (entries.length < 4) return entries;
+    const sc = entries.map(e => e.score).sort((a, b) => a - b);
+    const q1 = sc[Math.floor(sc.length * 0.25)];
+    const q3 = sc[Math.floor(sc.length * 0.75)];
+    const iqr = q3 - q1;
+    return entries.filter(e => e.score >= q1 - 1.5 * iqr && e.score <= q3 + 1.5 * iqr);
+  }
+
+  let chartInstance = null, bandPlugin = null;
+
+  function buildChart(useOutlier, showPred) {
+    const entries = useOutlier ? filterOutliers(allEntries) : allEntries;
+    const ys = entries.map(e => e.score);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    let expandedMin = yMin, expandedMax = yMax;
+
+    if (bandData) {
+      const sorted = [...bandData.bandScores].sort((a, b) => a - b);
+      const range = yMax - yMin, pad = range * 0.15;
+      sorted.forEach(b => {
+        if (b > yMin - range && b < yMax + range) {
+          expandedMin = Math.min(expandedMin, b - pad);
+          expandedMax = Math.max(expandedMax, b + pad);
+        }
+      });
+    }
+
+    const yPad = (expandedMax - expandedMin) * 0.05;
+
+    const datasets = [{
+      label: 'スコア',
+      data: entries.map(e => ({ x: e.date, y: e.score })),
+      borderColor: '#4e79c4',
+      backgroundColor: '#4e79c450',
+      pointRadius: 4,
+      tension: 0.1,
+      fill: false
+    }];
+
+    if (showPred && entries.length >= 2) {
+      const xs = entries.map(e => e.date.getTime());
+      const n = xs.length;
+      const xM = xs.reduce((a, b) => a + b, 0) / n;
+      const yM = ys.reduce((a, b) => a + b, 0) / n;
+      const slope = xs.reduce((s, x, i) => s + (x - xM) * (ys[i] - yM), 0) / xs.reduce((s, x) => s + (x - xM) ** 2, 0);
+      const intercept = yM - slope * xM;
+      const tEnd = new Date('2026-06-08T19:00:00+09:00').getTime();
+      const tLast = xs[xs.length - 1];
+      const predPts = Array.from({ length: 21 }, (_, i) => {
+        const t = tLast + (tEnd - tLast) * i / 20;
+        return { x: new Date(t), y: slope * t + intercept };
+      });
+      datasets.push({
+        label: '予測',
+        data: predPts,
+        borderColor: '#e05c5c',
+        borderDash: [5, 5],
+        pointRadius: 0,
+        tension: 0.1,
+        fill: false
+      });
+    }
+
+    if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+
+    if (bandPlugin) {
+      try {
+        const ex = Chart.registry.getPlugin('perfBandsFinal');
+        if (ex) Chart.unregister(ex);
+      } catch(e) {}
+      bandPlugin = null;
+    }
+
+    if (bandData) {
+      bandPlugin = makeBandPlugin(bandData.bandScores, bandData.highIsBetter);
+      Chart.register(bandPlugin);
+    }
+
+    chartInstance = new Chart(canvas, {
+      type: 'line',
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            type: 'time',
+            time: { unit: 'hour', displayFormats: { hour: 'MM/dd HH:mm' } },
+            ticks: { maxRotation: 45 }
+          },
+          y: {
+            title: { display: true, text: 'スコア' },
+            min: Math.floor(expandedMin - yPad),
+            max: Math.ceil(expandedMax + yPad)
+          }
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: i => new Date(i[0].parsed.x).toLocaleString('ja-JP')
+            }
+          }
+        }
+      }
+    });
+  }
+
+  buildChart(true, false);
+
+  outlierCb.addEventListener('change', () => buildChart(outlierCb.checked, predCb.checked));
+  predCb.addEventListener('change', () => buildChart(outlierCb.checked, predCb.checked));
 })();
