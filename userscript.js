@@ -3,7 +3,7 @@
 // @description  AHC Score Graph
 // @author       https://github.com/EdamAme-x/ahc-score-graph-user-script
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      2.0
 // @match        https://atcoder.jp/contests/*/submissions/me*
 // @grant        none
 // ==/UserScript==
@@ -13,7 +13,6 @@
 
   const contestMatch = location.pathname.match(/\/contests\/([^/]+)\//);
   if (!contestMatch) return;
-
   const contestId = contestMatch[1];
 
   function loadScript(url) {
@@ -45,7 +44,6 @@
     return entries;
   }
 
-  // ul.pager の Next が有効か（disabled でないか）を返す
   function hasNextPage(doc) {
     for (const li of doc.querySelectorAll('ul.pager li')) {
       if (li.classList.contains('disabled')) continue;
@@ -65,14 +63,12 @@
     const all = [];
     let page = 1;
     let doc = await fetchPage(page);
-
     while (true) {
       all.push(...parseSubmissionsFromDoc(doc));
       if (!hasNextPage(doc) || page >= 100) break;
       page++;
       doc = await fetchPage(page);
     }
-
     all.sort((a, b) => a.date - b.date);
     return all;
   }
@@ -87,6 +83,17 @@
       }
     }
     return null;
+  }
+
+  function removeOutliers(entries) {
+    if (entries.length < 4) return entries;
+    const scores = entries.map(e => e.score).sort((a, b) => a - b);
+    const q1 = scores[Math.floor(scores.length * 0.25)];
+    const q3 = scores[Math.floor(scores.length * 0.75)];
+    const iqr = q3 - q1;
+    const lower = q1 - 1.5 * iqr;
+    const upper = q3 + 1.5 * iqr;
+    return entries.filter(e => e.score >= lower && e.score <= upper);
   }
 
   function linreg(xs, ys) {
@@ -117,10 +124,14 @@
   let allEntries = [];
   let contestEnd = null;
 
-  function scoreDataset() {
+  function getEntries(filterOutliers) {
+    return filterOutliers ? removeOutliers(allEntries) : allEntries;
+  }
+
+  function scoreDataset(filterOutliers) {
     return {
       label: 'スコア',
-      data: allEntries.map(e => ({ x: e.date, y: e.score })),
+      data: getEntries(filterOutliers).map(e => ({ x: e.date, y: e.score })),
       borderColor: 'rgba(80,140,240,0.8)',
       backgroundColor: 'transparent',
       pointRadius: 3,
@@ -131,10 +142,12 @@
     };
   }
 
-  function buildPredDataset() {
-    const t0 = allEntries[0].date.getTime();
-    const xs = allEntries.map(e => (e.date.getTime() - t0) / 3600000);
-    const ys = allEntries.map(e => e.score);
+  function buildPredDataset(filterOutliers) {
+    const entries = getEntries(filterOutliers);
+    const t0 = entries[0].date.getTime();
+    const xs = entries.map(e => (e.date.getTime() - t0) / 3600000);
+    const ys = entries.map(e => e.score);
+
     const a = blendedSlope(xs, ys);
     const tLast = xs[xs.length - 1];
     const yLast = ys[ys.length - 1];
@@ -203,9 +216,9 @@
     };
   }
 
-  function update(on) {
-    chart.data.datasets = on ? [scoreDataset(), buildPredDataset()] : [scoreDataset()];
-    chart.options = getOptions(on);
+  function update(predOn, filterOn) {
+    chart.data.datasets = predOn ? [scoreDataset(filterOn), buildPredDataset(filterOn)] : [scoreDataset(filterOn)];
+    chart.options = getOptions(predOn);
     chart.update();
   }
 
@@ -222,14 +235,27 @@
     titleEl.style.cssText = 'font-weight:bold;font-size:15px;color:#333;';
     header.appendChild(titleEl);
 
-    const toggleWrap = document.createElement('label');
-    toggleWrap.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:13px;color:#555;cursor:pointer;user-select:none;';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.style.cursor = 'pointer';
-    toggleWrap.appendChild(checkbox);
-    toggleWrap.appendChild(document.createTextNode('スコア予測'));
-    header.appendChild(toggleWrap);
+    const controls = document.createElement('div');
+    controls.style.cssText = 'display:flex;align-items:center;gap:12px;';
+
+    const makeToggle = (label, defaultChecked) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:13px;color:#555;cursor:pointer;user-select:none;';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = defaultChecked;
+      cb.style.cursor = 'pointer';
+      wrap.appendChild(cb);
+      wrap.appendChild(document.createTextNode(label));
+      return { wrap, cb };
+    };
+
+    const { wrap: filterWrap, cb: filterCb } = makeToggle('外れ値除去', true);
+    const { wrap: predWrap, cb: predCb } = makeToggle('スコア予測', false);
+
+    controls.appendChild(filterWrap);
+    controls.appendChild(predWrap);
+    header.appendChild(controls);
     container.appendChild(header);
 
     const loading = document.createElement('p');
@@ -265,11 +291,12 @@
 
       chart = new Chart(canvas.getContext('2d'), {
         type: 'line',
-        data: { datasets: [scoreDataset()] },
+        data: { datasets: [scoreDataset(true)] },
         options: getOptions(false),
       });
 
-      checkbox.addEventListener('change', () => update(checkbox.checked));
+      filterCb.addEventListener('change', () => update(predCb.checked, filterCb.checked));
+      predCb.addEventListener('change', () => update(predCb.checked, filterCb.checked));
     } catch (err) {
       const el = document.getElementById('ahc-graph-loading');
       if (el) el.textContent = 'エラー: ' + err.message;
