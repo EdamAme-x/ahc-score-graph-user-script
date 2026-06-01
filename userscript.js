@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AHC Score Graph
 // @description  AHC Score Graph
-// @author       https://github.com/EdamAme-x
+// @author       https://github.com/EdamAme-x/ahc-score-graph-user-script
 // @namespace    http://tampermonkey.net/
 // @version      1.8
 // @match        https://atcoder.jp/contests/*/submissions/me*
