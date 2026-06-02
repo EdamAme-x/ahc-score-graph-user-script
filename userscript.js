@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AHC Score Graph
-// @description  AHC Score Graph
+// @description  AHC において、Score の遷移を見やすくするグラフを表示する。
 // @author       https://github.com/EdamAme-x/ahc-score-graph-user-script
 // @namespace    http://tampermonkey.net/
 // @version      2.1
