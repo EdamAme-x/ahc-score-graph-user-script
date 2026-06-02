@@ -6,6 +6,7 @@
 // @version      2.1
 // @match        https://atcoder.jp/contests/*/submissions/me*
 // @grant        none
+// @license MIT
 // ==/UserScript==
 
 (function () {
