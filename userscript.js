@@ -15,6 +15,8 @@
   if (!contestMatch) return;
   const contestId = contestMatch[1];
 
+  if (/^(abc|arc|agc)/i.test(contestId)) return;
+
   function loadScript(url) {
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
