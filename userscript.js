@@ -3,7 +3,7 @@
 // @description  AHC Score Graph
 // @author       https://github.com/EdamAme-x/ahc-score-graph-user-script
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @match        https://atcoder.jp/contests/*/submissions/me*
 // @grant        none
 // ==/UserScript==
@@ -75,18 +75,6 @@
     return all;
   }
 
-  function getContestEndDate() {
-    const links = document.querySelectorAll('a[href*="timeanddate"]');
-    if (links.length >= 2) {
-      const m = links[1].textContent.trim().match(/(\d{4}-\d{2}-\d{2})[^0-9]+(\d{2}:\d{2})/);
-      if (m) {
-        const d = new Date(`${m[1]}T${m[2]}:00+09:00`);
-        if (!isNaN(d.getTime())) return d;
-      }
-    }
-    return null;
-  }
-
   function removeOutliers(entries) {
     if (entries.length < 4) return entries;
     const scores = entries.map(e => e.score).sort((a, b) => a - b);
@@ -98,33 +86,8 @@
     return entries.filter(e => e.score >= lower && e.score <= upper);
   }
 
-  function linreg(xs, ys) {
-    const n = xs.length;
-    const mx = xs.reduce((s, x) => s + x, 0) / n;
-    const my = ys.reduce((s, y) => s + y, 0) / n;
-    let num = 0, den = 0;
-    for (let i = 0; i < n; i++) {
-      num += (xs[i] - mx) * (ys[i] - my);
-      den += (xs[i] - mx) ** 2;
-    }
-    return den === 0 ? 0 : num / den;
-  }
-
-  function blendedSlope(xs, ys) {
-    const N = Math.min(xs.length, 10);
-    let wA = 0, tW = 0;
-    for (let k = 3; k <= N; k++) {
-      const w = N - k + 1;
-      wA += w * linreg(xs.slice(-k), ys.slice(-k));
-      tW += w;
-    }
-    const raw = tW === 0 ? linreg(xs, ys) : wA / tW;
-    return raw * 0.5;
-  }
-
   let chart = null;
   let allEntries = [];
-  let contestEnd = null;
 
   function getEntries(filterOutliers) {
     return filterOutliers ? removeOutliers(allEntries) : allEntries;
@@ -144,41 +107,7 @@
     };
   }
 
-  function buildPredDataset(filterOutliers) {
-    const entries = getEntries(filterOutliers);
-    const t0 = entries[0].date.getTime();
-    const xs = entries.map(e => (e.date.getTime() - t0) / 3600000);
-    const ys = entries.map(e => e.score);
-
-    const a = blendedSlope(xs, ys);
-    const tLast = xs[xs.length - 1];
-    const yLast = ys[ys.length - 1];
-    const b = yLast - a * tLast;
-    const tEnd = (contestEnd.getTime() - t0) / 3600000;
-    const duration = tEnd - tLast;
-    const amp = yLast * 0.003;
-    const f1 = (2 * Math.PI) / (duration / 2.5);
-    const f2 = (2 * Math.PI) / (duration / 1.3);
-
-    return {
-      label: '予測',
-      data: Array.from({ length: 151 }, (_, i) => {
-        const t = tLast + duration * (i / 150);
-        const dt = t - tLast;
-        const noise = amp * (Math.sin(f1 * dt) + 0.5 * Math.cos(f2 * dt));
-        return { x: new Date(t0 + t * 3600000), y: Math.round(a * t + b + noise) };
-      }),
-      borderColor: 'rgba(240,140,40,0.8)',
-      backgroundColor: 'transparent',
-      pointRadius: 0,
-      borderWidth: 1.5,
-      borderDash: [5, 4],
-      showLine: true,
-      order: 3,
-    };
-  }
-
-  function getOptions(withPrediction) {
+  function getOptions() {
     return {
       responsive: true,
       maintainAspectRatio: false,
@@ -195,7 +124,6 @@
         x: {
           type: 'time',
           time: { displayFormats: { hour: 'HH:mm', minute: 'HH:mm' } },
-          ...(withPrediction && contestEnd ? { max: contestEnd } : {}),
           ticks: {
             maxRotation: 0,
             autoSkip: true,
@@ -218,9 +146,9 @@
     };
   }
 
-  function update(predOn, filterOn) {
-    chart.data.datasets = predOn ? [scoreDataset(filterOn), buildPredDataset(filterOn)] : [scoreDataset(filterOn)];
-    chart.options = getOptions(predOn);
+  function update(filterOn) {
+    chart.data.datasets = [scoreDataset(filterOn)];
+    chart.options = getOptions();
     chart.update();
   }
 
@@ -253,10 +181,7 @@
     };
 
     const { wrap: filterWrap, cb: filterCb } = makeToggle('外れ値除去', true);
-    const { wrap: predWrap, cb: predCb } = makeToggle('スコア予測', false);
-
     controls.appendChild(filterWrap);
-    controls.appendChild(predWrap);
     header.appendChild(controls);
     container.appendChild(header);
 
@@ -281,24 +206,22 @@
       await loadScript('https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js');
 
       const entries = await fetchAllPages();
-      contestEnd = getContestEndDate();
-      allEntries = entries;
-
-      document.getElementById('ahc-graph-loading')?.remove();
 
       if (entries.length === 0) {
-        container.insertAdjacentHTML('beforeend', '<p style="color:#888;text-align:center">データなし</p>');
+        container.remove();
         return;
       }
+
+      allEntries = entries;
+      document.getElementById('ahc-graph-loading')?.remove();
 
       chart = new Chart(canvas.getContext('2d'), {
         type: 'line',
         data: { datasets: [scoreDataset(true)] },
-        options: getOptions(false),
+        options: getOptions(),
       });
 
-      filterCb.addEventListener('change', () => update(predCb.checked, filterCb.checked));
-      predCb.addEventListener('change', () => update(predCb.checked, filterCb.checked));
+      filterCb.addEventListener('change', () => update(filterCb.checked));
     } catch (err) {
       const el = document.getElementById('ahc-graph-loading');
       if (el) el.textContent = 'エラー: ' + err.message;
